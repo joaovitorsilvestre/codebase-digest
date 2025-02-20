@@ -12,6 +12,7 @@ import sys
 import pyperclip
 import xml.etree.ElementTree as ET
 import html
+import re
 
 # Initialize colorama for colorful console output.
 init()
@@ -96,8 +97,31 @@ def read_file_content(file_path):
         return f"Error reading file: {str(e)}"
 
 
+def extract_classes_and_functions(content, filter_patterns):
+    """Extracts class and function definitions that contain the filter patterns."""
+    extracted_content = ""
+    class_pattern = re.compile(r"^\s*class\s+\w+.*?:(.*?)(?=\n^\s*class\s+\w+.*?:|\n^\s*def\s+\w+\(.*?\):|\Z)",
+                               re.DOTALL | re.MULTILINE)
+    function_pattern = re.compile(r"^\s*def\s+\w+\(.*?\):(.*?)(?=\n^\s*class\s+\w+.*?:|\n^\s*def\s+\w+\(.*?\):|\Z)",
+                                  re.DOTALL | re.MULTILINE)
+
+    # Find all class definitions
+    for match in class_pattern.finditer(content):
+        class_def = match.group(0)
+        if any(pattern in class_def for pattern in filter_patterns):
+            extracted_content += class_def + "\n\n"
+
+    # Find all function definitions
+    for match in function_pattern.finditer(content):
+        function_def = match.group(0)
+        if any(pattern in function_def for pattern in filter_patterns):
+            extracted_content += function_def + "\n\n"
+
+    return extracted_content
+
+
 def analyze_directory(path, ignore_patterns, base_path, include_git=False, max_depth=None, current_depth=0,
-                      filter_patterns=None):
+                      filter_patterns=None, extract_definitions=False):
     """Recursively analyzes a directory and its contents."""
     if max_depth is not None and current_depth > max_depth:
         return None
@@ -149,6 +173,13 @@ def analyze_directory(path, ignore_patterns, base_path, include_git=False, max_d
                             print(f"Debug: Skipping {item_path} because it does not match any filter patterns.")
                             continue  # Skip the file if it doesn't match the filter
 
+                        if extract_definitions:
+                            content = extract_classes_and_functions(content, filter_patterns)
+                            if not content:
+                                print(
+                                    f"Debug: Skipping {item_path} because it contains no matching definitions after filtering.")
+                                continue
+
                     tokens = count_tokens(content)
                     print(f"Debug: Text file {item_path}, size: {file_size}, content size: {len(content)}")
                     has_matching_files = True  # Set flag if a matching file is found
@@ -174,7 +205,7 @@ def analyze_directory(path, ignore_patterns, base_path, include_git=False, max_d
                         result["text_content_size"] += len(content)
             elif os.path.isdir(item_path):
                 subdir = analyze_directory(item_path, ignore_patterns, base_path, include_git, max_depth,
-                                           current_depth + 1, filter_patterns)
+                                           current_depth + 1, filter_patterns, extract_definitions)
                 if subdir and subdir["children"]:  # Only add subdir if it has matching files
                     subdir["is_ignored"] = is_ignored
                     result["children"].append(subdir)
@@ -409,12 +440,18 @@ def main():
                         help="Copy the output to clipboard after analysis")
     parser.add_argument("--filter", nargs="+",
                         help="Filter files based on content patterns. Only files containing these patterns will be included.")
+    parser.add_argument("--extract-definitions", action="store_true",
+                        help="Extract only class and function definitions that contain the filter patterns.")
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
         sys.exit(1)
 
     args = parser.parse_args()
+
+    if args.extract_definitions and args.no_content:
+        print(Fore.RED + "Error: --extract-definitions cannot be used with --no-content." + Style.RESET_ALL)
+        sys.exit(1)
 
     if not args.path:
         print(Fore.RED + "Error: Path argument is required." + Style.RESET_ALL)
@@ -451,7 +488,8 @@ def main():
 
     try:
         data = analyze_directory(args.path, ignore_patterns, args.path, include_git=args.include_git,
-                                 max_depth=args.max_depth, filter_patterns=args.filter)
+                                 max_depth=args.max_depth, filter_patterns=args.filter,
+                                 extract_definitions=args.extract_definitions)
 
         if data is None:
             print(Fore.YELLOW + "No matching files found after filtering." + Style.RESET_ALL)
