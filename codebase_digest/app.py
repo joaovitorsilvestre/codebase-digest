@@ -13,6 +13,10 @@ import pyperclip
 import xml.etree.ElementTree as ET
 import html
 import re
+import shutil
+import subprocess
+import tempfile
+
 
 # Initialize colorama for colorful console output.
 init()
@@ -120,8 +124,8 @@ def extract_classes_and_functions(content, filter_patterns):
     return extracted_content
 
 
-def analyze_directory(path, ignore_patterns, base_path, include_git=False, max_depth=None, current_depth=0,
-                      filter_patterns=None, extract_definitions=False):
+def analyze_directory(path, ignore_patterns, base_path, include_git, max_depth, current_depth,
+                      filter_patterns, extract_definitions, temp_dir):
     """Recursively analyzes a directory and its contents."""
     if max_depth is not None and current_depth > max_depth:
         return None
@@ -184,6 +188,13 @@ def analyze_directory(path, ignore_patterns, base_path, include_git=False, max_d
                     print(f"Debug: Text file {item_path}, size: {file_size}, content size: {len(content)}")
                     has_matching_files = True  # Set flag if a matching file is found
 
+                    # Copy file to temp directory
+                    if temp_dir:
+                        rel_path = os.path.relpath(item_path, base_path)
+                        dest_path = os.path.join(temp_dir, rel_path)
+                        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                        shutil.copy2(item_path, dest_path)  # copy2 preserves metadata
+
                 else:
                     content = "[Non-text file]"
                     tokens = 0
@@ -205,7 +216,8 @@ def analyze_directory(path, ignore_patterns, base_path, include_git=False, max_d
                         result["text_content_size"] += len(content)
             elif os.path.isdir(item_path):
                 subdir = analyze_directory(item_path, ignore_patterns, base_path, include_git, max_depth,
-                                           current_depth + 1, filter_patterns, extract_definitions)
+                                           current_depth + 1, filter_patterns, extract_definitions, temp_dir)
+
                 if subdir and subdir["children"]:  # Only add subdir if it has matching files
                     subdir["is_ignored"] = is_ignored
                     result["children"].append(subdir)
@@ -219,6 +231,14 @@ def analyze_directory(path, ignore_patterns, base_path, include_git=False, max_d
                 else:
                     print(
                         f"Debug: Skipping directory {item_path} because it contains no matching files after filtering.")
+                    # Remove empty directory from temp if it exists
+                    if temp_dir:
+                        rel_path = os.path.relpath(item_path, base_path)
+                        dest_path = os.path.join(temp_dir, rel_path)
+                        if os.path.exists(dest_path):
+                            shutil.rmtree(dest_path)
+                            print(f"Debug: Removing empty directory from temp: {dest_path}")
+
 
     except PermissionError:
         print(Fore.RED + f"Permission denied: {path}" + Style.RESET_ALL)
@@ -350,7 +370,7 @@ def generate_html_output(data):
     <li>Total directories: {data['dir_count']}</li>
     <li>Analyzed size: {data['size'] / 1024:.2f} KB</li>
     <li>Total text file size (including ignored): {data['total_text_size'] / 1024:.2f} KB</li>
-    <li>Total tokens: {data['total_tokens']}</li>
+    <li>Total tokens: {data['total_tokens']}\n"
     <li>Analyzed text content size: {data['text_content_size'] / 1024:.2f} KB</li>
     </ul>
     <h2>File Contents</h2>
@@ -399,6 +419,27 @@ def estimate_output_size(path, ignore_patterns, base_path):
     return estimated_size
 
 
+def create_zip_archive(source_dir, output_filename):
+    """Creates a zip archive of the given directory using the system's zip command."""
+    try:
+        command = ['zip', '-r', output_filename, '.']  # The dot is important for relative paths
+        process = subprocess.Popen(command, cwd=source_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
+
+        if process.returncode != 0:
+            print(Fore.RED + f"Error creating zip archive: {stderr.decode()}" + Style.RESET_ALL)
+            return False
+        else:
+            print(Fore.GREEN + f"Zip archive created successfully: {output_filename}" + Style.RESET_ALL)
+            return True
+    except FileNotFoundError:
+        print(Fore.RED + "Error: zip command not found. Please ensure it is installed." + Style.RESET_ALL)
+        return False
+    except Exception as e:
+        print(Fore.RED + f"An unexpected error occurred while creating zip archive: {str(e)}" + Style.RESET_ALL)
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze and visualize codebase structure. Can filter by content.",
@@ -442,6 +483,8 @@ def main():
                         help="Filter files based on content patterns. Only files containing these patterns will be included.")
     parser.add_argument("--extract-definitions", action="store_true",
                         help="Extract only class and function definitions that contain the filter patterns.")
+    parser.add_argument("--create-zip", action="store_true",
+                        help="Create a zip archive of the analyzed files in the current directory.")
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -486,14 +529,28 @@ def main():
         print(
             Fore.YELLOW + "This is likely due to large files or directories that will be ignored in the analysis." + Style.RESET_ALL)
 
+    temp_dir = None
     try:
-        data = analyze_directory(args.path, ignore_patterns, args.path, include_git=args.include_git,
-                                 max_depth=args.max_depth, filter_patterns=args.filter,
-                                 extract_definitions=args.extract_definitions)
+        # Create a temporary directory if --create-zip is specified
+        if args.create_zip:
+            temp_dir = tempfile.mkdtemp(prefix="codeconsolidator_", dir="/tmp")
+            print(Fore.CYAN + f"Creating temporary directory for zip: {temp_dir}" + Style.RESET_ALL)
+
+        data = analyze_directory(args.path, ignore_patterns, args.path, args.include_git, args.max_depth,
+                                 0, args.filter, args.extract_definitions, temp_dir)
 
         if data is None:
             print(Fore.YELLOW + "No matching files found after filtering." + Style.RESET_ALL)
             sys.exit(0)
+
+        # Clean up empty directories in the temporary directory *after* the analysis
+        if temp_dir:
+            for root, dirs, files in os.walk(temp_dir, topdown=False):  # Use topdown=False to delete deepest first
+                for dir_name in dirs:
+                    dir_path = os.path.join(root, dir_name)
+                    if not os.listdir(dir_path):  # Check if directory is empty
+                        shutil.rmtree(dir_path)
+                        print(f"Debug: Removing empty directory from temp after analysis: {dir_path}")
 
         # Generate output based on the chosen format
         if args.output_format == "json":
@@ -552,9 +609,23 @@ def main():
                 except Exception as e:
                     print(Fore.RED + f"Failed to copy to clipboard: {str(e)}" + Style.RESET_ALL)
 
+        # Create zip archive if specified
+        if args.create_zip:
+            zip_filename = f"{os.path.basename(args.path)}_codebase_digest.zip"
+            if create_zip_archive(temp_dir, os.path.join(os.getcwd(), zip_filename)):  # Saves to current directory
+                print(Fore.GREEN + f"Successfully created zip archive: {zip_filename} in current directory" + Style.RESET_ALL)
+
     except Exception as e:
         print(Fore.RED + f"An error occurred: {str(e)}" + Style.RESET_ALL)
         sys.exit(1)
+    finally:
+        # Cleanup the temporary directory
+        if temp_dir:
+            try:
+                shutil.rmtree(temp_dir)
+                print(Fore.CYAN + f"Removed temporary directory: {temp_dir}" + Style.RESET_ALL)
+            except Exception as e:
+                print(Fore.RED + f"Error removing temporary directory: {str(e)}" + Style.RESET_ALL)
 
     if data['text_content_size'] / 1024 > args.max_size:
         print(
@@ -566,4 +637,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # exemplo:
+    # cdigest ~/condominio --filter RepoEmpregadorLeitura --extract-definitions --create-zip -f arquivos.zip
     main()
